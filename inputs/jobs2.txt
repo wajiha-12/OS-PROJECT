@@ -1,0 +1,8 @@
+#all jobs arrive at time 0
+#unsorted ids,4th column=priority, lower=better
+P4 0 6 2
+P1 0 8 3
+P3 0 2 1
+P2 0 4 4
+P6 0 3 5
+P5 0 7 2

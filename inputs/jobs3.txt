@@ -1,0 +1,6 @@
+#idle gap: the ready queue becomes empty at t=5 and the next job only arrives at t=9
+P1 0 3
+P2 2 2
+P3 9 4
+P4 10 2
+P5 20 3
