@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <limits.h>
 #include <time.h>
@@ -31,9 +30,9 @@ static pthread_mutex_t stateMtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t outMtx   = PTHREAD_MUTEX_INITIALIZER;
 
 static sem_t runSem[maxJobs];   /* run[i]  : dispatcher -> job i, "run one unit", init 0 */
-static sem_t doneSem;    /* done    : job -> dispatcher, "unit finished",  init 0 */
-static sem_t arriveGo;      /* dispatcher -> arrival thread, "boundary t",    init 0 */
-static sem_t arriveAck;    /* arrival thread -> dispatcher, "arrivals done", init 0 */
+static sem_t doneSem;    /* done....job -> dispatcher, "unit finished",  init 0 */
+static sem_t arriveGo;      /* dispatcher -> arrival thread, "boundary t",init 0 */
+static sem_t arriveAck;    /* arrival thread -> dispatcher, "arrivals done",init 0 */
 
 static int now_t = 0;
 static int ready[maxJobs];      /* indices of arrived, unfinished, not-running jobs */
@@ -46,55 +45,57 @@ static long unitNs = (long)TIME_UNIT_MS * 1000000L;
 // ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○
 //helpers           
 // ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○
-static void perror(const char *msg){
+static void fatal(const char *msg){
     fprintf(stderr, "perror: %s\n", msg);
-    if (logFd >= 0)
+    
+    if(logFd >= 0)
         close(logFd);
+
     exit(1);
 }
 
 static void sem_wait_ok(sem_t *s){
-    if (sem_wait(s) == -1)
-        perror("sem_wait failed");
+    if (sem_wait(s)== -1)
+        fatal("sem_wait failed");
 }
 
 static void sleep_unit(void){
-    struct timespec ts = { unitNs / 1000000000L, unitNs % 1000000000L };
+    struct timespec ts = { unitNs/1000000000L, unitNs%1000000000L };
     nanosleep(&ts, NULL);
 }
 
-static void emit(const char *fmt, ...){
-    va_list ap;
-    pthread_mutex_lock(&outMtx);
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
-    fflush(stdout);
-    pthread_mutex_unlock(&outMtx);
-}
-
 /* one line to the logger process through the pipe */
-static void log_line(const char *fmt, ...){
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n < 0)
-        return;
-    if (n >= (int)sizeof(buf))
-        n = (int)sizeof(buf) - 1;
+static void log_line(const char *text){
+    int n = (int)strlen(text);
 
     pthread_mutex_lock(&outMtx);
-    if (logFd >= 0 && write(logFd, buf, (size_t)n) != n) {
+    if (logFd >= 0 && write(logFd, text, n) != n) {
         close(logFd);              /* logger died: stop logging, keep scheduling */
+        
         logFd = -1;
     }
     pthread_mutex_unlock(&outMtx);
 }
 
 static void log_event(int t, const char *what, int pidNum){
-    log_line("t=%d %s P%d\n", t, what, pidNum);
+    char text[100];
+
+    snprintf(text, sizeof(text), "t=%d %s P%d\n", t, what, pidNum);
+    log_line(text);
+}
+
+static void log_run(const char *inputName, const char *algoName){
+    char text[300];
+
+    snprintf(text, sizeof(text), "=== RUN input=%.200s algorithm=%s ===\n", inputName, algoName);
+    log_line(text);
+}
+
+static void log_run_rr(const char *inputName, int quantum){
+    char text[300];
+
+    snprintf(text, sizeof(text), "=== RUN input=%.200s algorithm=RR quantum=%d ===\n", inputName, quantum);
+    log_line(text);
 }
 
 // ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○
@@ -115,7 +116,10 @@ static void *arrival_thread(void *arg){
             if (jobs[i].arrival == t) {
                 ready[readyCount++] = i;
                 log_event(t, "ARRIVED", jobs[i].pidNum);
-                emit("[t=%2d] P%d arrived\n", t, jobs[i].pidNum);
+                pthread_mutex_lock(&outMtx);
+                printf("[t=%2d] P%d arrived\n", t, jobs[i].pidNum);
+                fflush(stdout);
+                pthread_mutex_unlock(&outMtx);
             }
         }
         pthread_mutex_unlock(&stateMtx);
@@ -136,7 +140,10 @@ static void *job_thread(void *arg){
         int rem = jobs[i].remaining;
         pthread_mutex_unlock(&stateMtx);
 
-        emit("[t=%2d] P%d running (remaining %d)\n", t, jobs[i].pidNum, rem);
+        pthread_mutex_lock(&outMtx);
+        printf("[t=%2d] P%d running (remaining %d)\n", t, jobs[i].pidNum, rem);
+        fflush(stdout);
+        pthread_mutex_unlock(&outMtx);
         sleep_unit();                        /* simulate one unit of CPU work */
 
         pthread_mutex_lock(&stateMtx);
@@ -168,14 +175,38 @@ static int better(int algo, int a, int b)
 {
     int ka = 0, kb = 0;
     switch (algo) {
-    case fcfs_algo: ka = 0;                 kb = 0;                 break;
-    case sjf_algo:  ka = jobs[a].burst;     kb = jobs[b].burst;     break;
-    case srtf_algo: ka = jobs[a].remaining; kb = jobs[b].remaining; break;
-    case prio_algo: ka = jobs[a].priority;  kb = jobs[b].priority;  break;
-    default: break;
+        case fcfs_algo: {
+            ka = 0;                 
+            kb = 0;                 
+            break;
+        }
+
+        case sjf_algo:{  
+            ka = jobs[a].burst;     
+            kb = jobs[b].burst;     
+            break;
+        }
+        
+        
+        case srtf_algo:{ 
+            ka = jobs[a].remaining; 
+            kb = jobs[b].remaining; 
+            break;
+        }
+        
+        case prio_algo: {
+            ka = jobs[a].priority;  
+            kb = jobs[b].priority;  
+            break;
+        }
+
+        default: 
+            break;
     }
+
     if (ka != kb)
         return ka < kb;
+   
     if (jobs[a].arrival != jobs[b].arrival)
         return jobs[a].arrival < jobs[b].arrival;
     return a < b;
@@ -190,40 +221,47 @@ static int pick_ready(int algo)
     return best;
 }
 
-/* preemption only when STRICTLY better on the main metric (equal -> running job continues) */
+/* preemption only when STRICTLY better on the main metric....if equal then running job continues */
 static int preempts(int algo, int cand, int running)
 {
     if (algo == srtf_algo)
-        return jobs[cand].remaining < jobs[running].remaining;
+        return (jobs[cand].remaining < jobs[running].remaining);
    
     if (algo == prio_algo)
-        return jobs[cand].priority < jobs[running].priority;
+        return (jobs[cand].priority < jobs[running].priority);
+
     return 0;
 }
 
-// ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ */
+// ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○
 // Gantt chart    
 // ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○
-struct GanttEntry { int start, end, label; };      /* label = job index, -1 = IDLE */
-struct Gantt { struct GanttEntry *e; int count, cap; };
+struct GanttEntry { 
+    int start, end, label; 
+};      /* label = job index, -1 = IDLE */
 
-static void gantt_add(struct Gantt *g, int t, int label)
-{
-    if (g->count > 0 && g->e[g->count - 1].label == label && g->e[g->count - 1].end == t) {
-        g->e[g->count - 1].end = t + 1;
+struct Gantt { 
+    struct GanttEntry *e; 
+    int count,cap; 
+};
+
+static void gantt_add(struct Gantt *g, int t, int label){
+    if (g->count > 0 && g->e[g->count-1].label== label && g->e[g->count-1].end == t){
+        g->e[g->count- 1].end = t+1;
         return;
     }
     
-    if (g->count == g->cap) {
-        g->cap = g->cap ? g->cap * 2 : 64;
+    if (g->count== g->cap) {
+        g->cap = (g->cap)? (g->cap*2) : 64;
         g->e = realloc(g->e, (size_t)g->cap * sizeof(struct GanttEntry));
+        
         if (g->e == NULL)
-            perror("out of memory");
+            fatal("out of memory");
     }
     
     g->e[g->count].start = t;
-    g->e[g->count].end = t + 1;
-    g->e[g->count].label = label;
+    g->e[g->count].end = t+1;
+    g->e[g->count].label=label;
     g->count++;
 }
 
@@ -237,21 +275,26 @@ static void gantt_print(const struct Gantt *g)
         else
             printf(" [%d-%d:P%d]", g->e[i].start, g->e[i].end, jobs[g->e[i].label].pidNum);
     }
+    
     printf("\n");
 
-    if (g->count <= 30) {        /* drawn bar only when it fits on a line */
+    if (g->count <= 30) {
         for (int i = 0; i < g->count; i++) {
             char cell[16];
             if (g->e[i].label == -1)
                 snprintf(cell, sizeof(cell), "IDLE");
             else
                 snprintf(cell, sizeof(cell), "P%d", jobs[g->e[i].label].pidNum);
+            
             printf("|%-7s", cell);
         }
+       
         printf("|\n");
+        
         for (int i = 0; i < g->count; i++)
             printf("%-8d", g->e[i].start);
-        printf("%d\n", g->count ? g->e[g->count - 1].end : 0);
+        
+        printf("%d\n", g->count ? g->e[g->count-1].end: 0);
     }
 }
 
@@ -266,26 +309,27 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
         jobs[i].firstStart = -1;
         jobs[i].completion = 0;
     }
+    
     now_t = 0;
     readyCount = 0;
     arrivalStop = 0;
 
-    if (sem_init(&doneSem, 0, 0) || sem_init(&arriveGo, 0, 0) || sem_init(&arriveAck, 0, 0))
-        perror("sem_init failed");
+    if(sem_init(&doneSem, 0, 0) || sem_init(&arriveGo, 0, 0) || sem_init(&arriveAck, 0, 0))
+        fatal("sem_init failed");
 
     for (int i = 0; i < numJobs; i++){
         if (sem_init(&runSem[i], 0, 0)){
-            perror("sem_init failed");}
+            fatal("sem_init failed");}
     }
 
     pthread_t jobTid[maxJobs], arrTid;
     for (int i = 0; i < numJobs; i++){
-        if (pthread_create(&jobTid[i], NULL, job_thread, (void *)(intptr_t)i) != 0)
-            perror("pthread_create failed");
+        if(pthread_create(&jobTid[i], NULL, job_thread, (void *)(intptr_t)i) != 0)
+            fatal("pthread_create failed");
     }
 
     if (pthread_create(&arrTid, NULL, arrival_thread, NULL) != 0){
-        perror("pthread_create failed");
+        fatal("pthread_create failed");
     }
 
 
@@ -298,11 +342,11 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
     }
     
     if (algo == rr_algo){
-        log_line("=== RUN input=%s algorithm=RR quantum=%d ===\n", inputName, quantum);
+        log_run_rr(inputName, quantum);
     }
     
     else{
-        log_line("=== RUN input=%s algorithm=%s ===\n", inputName, ALGO_NAMES[algo]);
+        log_run(inputName, ALGO_NAMES[algo]);
     }
     
     struct Gantt gantt = {NULL, 0, 0};
@@ -353,7 +397,10 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
 
         if (running == -1) {       /* nothing ready: CPU idle for one unit */
             pthread_mutex_unlock(&stateMtx);
-            emit("[t=%2d] IDLE\n", t);
+            pthread_mutex_lock(&outMtx);
+            printf("[t=%2d] IDLE\n", t);
+            fflush(stdout);
+            pthread_mutex_unlock(&outMtx);
             sleep_unit();
             pthread_mutex_lock(&stateMtx);
             gantt_add(&gantt, t, -1);
@@ -371,8 +418,10 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
                 ctxSwitches++;
                 if (jobs[lastJob].remaining > 0)
                     log_event(t, "PREEMPTED", jobs[lastJob].pidNum);
-                emit("[t=%2d] ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- context switch: P%d -> P%d ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ-\n", t,
-                     jobs[lastJob].pidNum, jobs[chosen].pidNum);
+                pthread_mutex_lock(&outMtx);
+                printf("[t=%2d] ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- context switch: P%d -> P%d ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ-\n", t, jobs[lastJob].pidNum, jobs[chosen].pidNum);
+                fflush(stdout);
+                pthread_mutex_unlock(&outMtx);
             }
             log_event(t, jobs[chosen].firstStart == -1 ? "STARTED" : "RESUMED", jobs[chosen].pidNum);
         }
@@ -398,7 +447,10 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
             finished++;
             running = -1;
             log_event(t, "FINISHED", jobs[chosen].pidNum);
-            emit("[t=%2d] P%d finished\n", t, jobs[chosen].pidNum);
+            pthread_mutex_lock(&outMtx);
+            printf("[t=%2d] P%d finished\n", t, jobs[chosen].pidNum);
+            fflush(stdout);
+            pthread_mutex_unlock(&outMtx);
         }
         
         pthread_mutex_unlock(&stateMtx);
@@ -470,8 +522,8 @@ static void simulate(int algo, int quantum, const char *inputName, struct AlgoRe
     free(gantt.e);
 }
 
-/* ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ 
-/* ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ 
+// ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ 
+// ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓₓ˚. ୭ 
 static void print_comparison(const struct AlgoResult *r, int n, int quantum)
 {
     printf("\n=== COMPARISON (quantum=%d) ===\n", quantum);
@@ -612,14 +664,14 @@ int main(int argc, char *argv[])
     /* ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- Part 5: start the logger process ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- */
     int logPipe[2];
     if (pipe(logPipe) == -1) {
-        perror("pipe");
+        fatal("pipe");
         return 1;
     }
     fflush(stdout);
     pid_t loggerPid = fork();
    
     if (loggerPid == -1) {
-        perror("fork (logger)");
+        fatal("fork (logger)");
         return 1;
     }
    
@@ -630,7 +682,7 @@ int main(int argc, char *argv[])
             _exit(126);
         close(logPipe[0]);     /* original fd no longer needed */
         execl(loggerPath, "logger", "schedule.log", (char *)NULL);
-        perror("exec logger");
+        fatal("exec logger");
         _exit(127);
     }
     close(logPipe[0]); /* scheduler never reads the pipe */
@@ -655,20 +707,20 @@ int main(int argc, char *argv[])
     // ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- Part 6: shared memory+ report process ₓ˚. ୭ ˚○◦˚.˚◦○˚ ୧ .˚ₓ- 
     int shmId = shmget(IPC_PRIVATE, sizeof(struct SharedReport), IPC_CREAT | 0600);
     if (shmId == -1) {
-        perror("shmget");
+        fatal("shmget");
         return 1;
     }
     struct SharedReport *shm = shmat(shmId, NULL, 0);
     
     if (shm == (void *)-1) {
-        perror("shmat");
+        fatal("shmat");
         shmctl(shmId, IPC_RMID, NULL);
         return 1;
     }
     memset(shm, 0, sizeof(*shm));
     
     if (sem_init(&shm->ready, 1, 0) == -1) { /* pshared=1, initial value 0 */
-        perror("sem_init");
+        fatal("sem_init");
         shmdt(shm);
         shmctl(shmId, IPC_RMID, NULL);
         return 1;
@@ -681,7 +733,7 @@ int main(int argc, char *argv[])
     pid_t reportPid = fork();
     
     if (reportPid == -1) {
-        perror("fork (report)");
+        fatal("fork (report)");
         sem_destroy(&shm->ready);
         shmdt(shm);
         shmctl(shmId, IPC_RMID, NULL);
@@ -689,7 +741,7 @@ int main(int argc, char *argv[])
     }
     if (reportPid == 0) {
         execl(reportPath, "report", shmArg, (char *)NULL);
-        perror("exec report");
+        fatal("exec report");
         _exit(127);
     }
 
